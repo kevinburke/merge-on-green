@@ -104,6 +104,11 @@ func run(ctx context.Context, maxRetries int) error {
 			continue
 		}
 
+		// Update the local default branch to match what we just pushed.
+		if err := updateLocalBranch(ctx, defaultBranch); err != nil {
+			slog.Warn("pushed successfully but failed to update local branch", "branch", defaultBranch, "error", err.Error())
+		}
+
 		slog.Info("merged", "branch", branch, "into", defaultBranch)
 		return nil
 	}
@@ -200,6 +205,15 @@ func forcePush(ctx context.Context, branch string) error {
 func waitForCI(ctx context.Context, ciCmd string) error {
 	// TODO: add --quiet to buildkite, then uncomment here.
 	cmd := exec.CommandContext(ctx, ciCmd, "wait" /*, "--quiet" */)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// updateLocalBranch fast-forwards the local default branch ref to match
+// origin, so it stays in sync after we push.
+func updateLocalBranch(ctx context.Context, defaultBranch string) error {
+	cmd := exec.CommandContext(ctx, "git", "fetch", "origin", defaultBranch+":"+defaultBranch)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
