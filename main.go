@@ -13,6 +13,11 @@ import (
 
 const Version = "0.1"
 
+type worktreeInfo struct {
+	path   string
+	branch string
+}
+
 func main() {
 	version := flag.Bool("version", false, "Print version and exit")
 	maxRetries := flag.Int("max-retries", 5, "Maximum number of rebase/retry attempts")
@@ -104,9 +109,8 @@ func run(ctx context.Context, maxRetries int) error {
 			continue
 		}
 
-		// Update the local default branch to match what we just pushed.
-		if err := updateLocalBranch(ctx, defaultBranch); err != nil {
-			slog.Warn("pushed successfully but failed to update local branch", "branch", defaultBranch, "error", err.Error())
+		if err := postMergeCleanup(ctx, branch, defaultBranch); err != nil {
+			slog.Warn("pushed successfully but post-merge cleanup failed", "branch", branch, "default_branch", defaultBranch, "error", err.Error())
 		}
 
 		slog.Info("merged", "branch", branch, "into", defaultBranch)
@@ -210,13 +214,159 @@ func waitForCI(ctx context.Context, ciCmd string) error {
 	return cmd.Run()
 }
 
-// updateLocalBranch fast-forwards the local default branch ref to match
-// origin, so it stays in sync after we push.
-func updateLocalBranch(ctx context.Context, defaultBranch string) error {
-	cmd := exec.CommandContext(ctx, "git", "fetch", "origin", defaultBranch+":"+defaultBranch)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+func postMergeCleanup(ctx context.Context, branch, defaultBranch string) error {
+	worktrees, err := listWorktrees(ctx)
+	if err != nil {
+		return err
+	}
+
+	controlDir, err := gitRoot(ctx)
+	if err != nil {
+		return err
+	}
+	defaultWorktree, hasDefaultWorktree := findOptionalWorktreeForBranch(worktrees, defaultBranch)
+	branchWorktree, hasBranchWorktree := findOptionalWorktreeForBranch(worktrees, branch)
+
+	if hasDefaultWorktree {
+		controlDir = defaultWorktree.path
+		err = resetDefaultBranchWorktree(ctx, defaultWorktree.path, defaultBranch)
+	} else {
+		err = updateDefaultBranchRef(ctx, controlDir, defaultBranch)
+	}
+	if err != nil {
+		return err
+	}
+
+	if hasBranchWorktree {
+		if hasDefaultWorktree && branchWorktree.path == defaultWorktree.path {
+			return fmt.Errorf("refusing to remove worktree %s because branch %s is also the default branch worktree", branchWorktree.path, branch)
+		}
+		if isCurrentWorktree(branchWorktree.path, controlDir) {
+			if hasDefaultWorktree {
+				return fmt.Errorf("refusing to delete branch %s because merge-on-green is running from the checkout at %s", branch, branchWorktree.path)
+			}
+			if err := switchCurrentCheckoutToDefault(ctx, controlDir, branch, defaultBranch); err != nil {
+				return err
+			}
+			slog.Info("deleting merged local branch", "branch", branch)
+			if err := runGitCommand(ctx, controlDir, "branch", "-d", branch); err != nil {
+				return fmt.Errorf("deleting local branch %s: %w", branch, err)
+			}
+			return nil
+		}
+		if err := ensureCleanWorktree(ctx, branchWorktree.path, branch); err != nil {
+			return err
+		}
+		slog.Info("removing merged branch worktree", "branch", branch, "path", branchWorktree.path)
+		if err := runGitCommand(ctx, controlDir, "worktree", "remove", branchWorktree.path); err != nil {
+			return fmt.Errorf("removing worktree for branch %s: %w", branch, err)
+		}
+	}
+
+	slog.Info("deleting merged local branch", "branch", branch)
+	if err := runGitCommand(ctx, controlDir, "branch", "-d", branch); err != nil {
+		return fmt.Errorf("deleting local branch %s: %w", branch, err)
+	}
+	return nil
+}
+
+func listWorktrees(ctx context.Context) ([]worktreeInfo, error) {
+	out, err := execOutput(ctx, "git", "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, fmt.Errorf("listing worktrees: %w", err)
+	}
+
+	blocks := strings.Split(strings.TrimSpace(out), "\n\n")
+	worktrees := make([]worktreeInfo, 0, len(blocks))
+	for _, block := range blocks {
+		if strings.TrimSpace(block) == "" {
+			continue
+		}
+		var wt worktreeInfo
+		for _, line := range strings.Split(block, "\n") {
+			switch {
+			case strings.HasPrefix(line, "worktree "):
+				wt.path = strings.TrimPrefix(line, "worktree ")
+			case strings.HasPrefix(line, "branch refs/heads/"):
+				wt.branch = strings.TrimPrefix(line, "branch refs/heads/")
+			}
+		}
+		if wt.path != "" {
+			worktrees = append(worktrees, wt)
+		}
+	}
+	if len(worktrees) == 0 {
+		return nil, fmt.Errorf("no git worktrees found")
+	}
+	return worktrees, nil
+}
+
+func findOptionalWorktreeForBranch(worktrees []worktreeInfo, branch string) (worktreeInfo, bool) {
+	for _, wt := range worktrees {
+		if wt.branch == branch {
+			return wt, true
+		}
+	}
+	return worktreeInfo{}, false
+}
+
+func resetDefaultBranchWorktree(ctx context.Context, worktreePath, defaultBranch string) error {
+	slog.Info("updating default branch worktree", "branch", defaultBranch, "path", worktreePath)
+	if err := runGitCommand(ctx, worktreePath, "fetch", "origin"); err != nil {
+		return fmt.Errorf("fetching origin in %s: %w", worktreePath, err)
+	}
+	if err := runGitCommand(ctx, worktreePath, "reset", "--hard", "origin/"+defaultBranch); err != nil {
+		return fmt.Errorf("resetting %s to origin/%s in %s: %w", defaultBranch, defaultBranch, worktreePath, err)
+	}
+	return nil
+}
+
+func updateDefaultBranchRef(ctx context.Context, controlDir, defaultBranch string) error {
+	slog.Info("updating local default branch ref", "branch", defaultBranch)
+	if err := runGitCommand(ctx, controlDir, "fetch", "origin"); err != nil {
+		return fmt.Errorf("fetching origin in %s: %w", controlDir, err)
+	}
+	if err := runGitCommand(ctx, controlDir, "update-ref", "refs/heads/"+defaultBranch, "refs/remotes/origin/"+defaultBranch); err != nil {
+		return fmt.Errorf("updating local branch ref %s in %s: %w", defaultBranch, controlDir, err)
+	}
+	return nil
+}
+
+func switchCurrentCheckoutToDefault(ctx context.Context, controlDir, branch, defaultBranch string) error {
+	if err := ensureCleanWorktree(ctx, controlDir, branch); err != nil {
+		return err
+	}
+	slog.Info("switching current checkout to default branch", "from", branch, "to", defaultBranch)
+	if err := runGitCommand(ctx, controlDir, "checkout", defaultBranch); err != nil {
+		return fmt.Errorf("checking out %s in %s: %w", defaultBranch, controlDir, err)
+	}
+	if err := runGitCommand(ctx, controlDir, "reset", "--hard", "origin/"+defaultBranch); err != nil {
+		return fmt.Errorf("resetting %s to origin/%s in %s: %w", defaultBranch, defaultBranch, controlDir, err)
+	}
+	return nil
+}
+
+func ensureCleanWorktree(ctx context.Context, worktreePath, branch string) error {
+	if err := execSilentInDir(ctx, worktreePath, "git", "diff", "--quiet", "HEAD"); err != nil {
+		return fmt.Errorf("refusing to remove worktree %s for branch %s: uncommitted changes present", worktreePath, branch)
+	}
+	if err := execSilentInDir(ctx, worktreePath, "git", "diff", "--cached", "--quiet", "HEAD"); err != nil {
+		return fmt.Errorf("refusing to remove worktree %s for branch %s: staged changes present", worktreePath, branch)
+	}
+	out, err := execOutputInDir(ctx, worktreePath, "git", "ls-files", "--others", "--exclude-standard")
+	if err != nil {
+		return fmt.Errorf("checking for untracked files in %s: %w", worktreePath, err)
+	}
+	if out != "" {
+		return fmt.Errorf("refusing to remove worktree %s for branch %s: untracked files present", worktreePath, branch)
+	}
+	return nil
+}
+
+func isCurrentWorktree(targetPath, currentPath string) bool {
+	targetClean := filepath.Clean(targetPath)
+	currentClean := filepath.Clean(currentPath)
+	return currentClean == targetClean || strings.HasPrefix(currentClean, targetClean+string(os.PathSeparator))
 }
 
 func pushToDefault(ctx context.Context, defaultBranch string) error {
@@ -227,7 +377,13 @@ func pushToDefault(ctx context.Context, defaultBranch string) error {
 }
 
 func execOutput(ctx context.Context, name string, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, name, args...).Output()
+	return execOutputInDir(ctx, "", name, args...)
+}
+
+func execOutputInDir(ctx context.Context, dir, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
@@ -235,5 +391,19 @@ func execOutput(ctx context.Context, name string, args ...string) (string, error
 }
 
 func execSilent(ctx context.Context, name string, args ...string) error {
-	return exec.CommandContext(ctx, name, args...).Run()
+	return execSilentInDir(ctx, "", name, args...)
+}
+
+func execSilentInDir(ctx context.Context, dir, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	return cmd.Run()
+}
+
+func runGitCommand(ctx context.Context, dir string, args ...string) error {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
