@@ -323,12 +323,20 @@ func ensureBranchPushed(ctx context.Context, dir, branch string) error {
 }
 
 func waitForCI(ctx context.Context, dir, ciCmd string) error {
-	// TODO: add --quiet to buildkite, then uncomment here.
-	cmd := exec.CommandContext(ctx, ciCmd, "wait" /*, "--quiet" */)
+	cmd := exec.CommandContext(ctx, ciCmd, waitCommandArgs(ciCmd)...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func waitCommandArgs(ciCmd string) []string {
+	args := []string{"wait"}
+	if ciCmd == "github-actions" {
+		args = append(args, "--cancel-previous-runs")
+	}
+	// TODO: add --quiet to buildkite, then uncomment here.
+	return args
 }
 
 func postMergeCleanup(ctx context.Context, branch, defaultBranch string) error {
