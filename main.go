@@ -314,7 +314,10 @@ func ensureBranchPushed(ctx context.Context, dir, branch string) error {
 		return fmt.Errorf("checking whether %s is on origin: %w", headSHA, err)
 	}
 	if remoteRefs == "" {
-		return fmt.Errorf("current commit %s is not present on origin; run git push origin %s before waiting for CI", headSHA, branch)
+		slog.Info("current commit is not present on origin; force pushing branch", "branch", branch, "commit", headSHA)
+		if err := forcePush(ctx, dir, branch); err != nil {
+			return fmt.Errorf("force pushing %s to origin: %w", branch, err)
+		}
 	}
 	return nil
 }
