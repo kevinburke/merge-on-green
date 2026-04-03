@@ -82,6 +82,10 @@ func run(ctx context.Context, maxRetries int) error {
 			}
 		}
 
+		if err := ensureBranchPushed(ctx, branch); err != nil {
+			return err
+		}
+
 		slog.Info("waiting for CI to complete")
 		if err := waitForCI(ctx, ciCmd); err != nil {
 			// CI failure: the wait command already printed the output.
@@ -204,6 +208,22 @@ func forcePush(ctx context.Context, branch string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func ensureBranchPushed(ctx context.Context, branch string) error {
+	headSHA, err := execOutput(ctx, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("resolving HEAD: %w", err)
+	}
+
+	remoteRefs, err := execOutput(ctx, "git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", "--contains", "HEAD")
+	if err != nil {
+		return fmt.Errorf("checking whether %s is on origin: %w", headSHA, err)
+	}
+	if remoteRefs == "" {
+		return fmt.Errorf("current commit %s is not present on origin; run git push origin %s before waiting for CI", headSHA, branch)
+	}
+	return nil
 }
 
 func waitForCI(ctx context.Context, ciCmd string) error {
