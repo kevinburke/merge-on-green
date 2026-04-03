@@ -16,12 +16,12 @@ func TestWaitCommandArgs(t *testing.T) {
 		{
 			name:  "github actions cancels older runs",
 			ciCmd: "github-actions",
-			want:  []string{"wait", "--cancel-previous-runs"},
+			want:  []string{"wait", "--cancel-previous-runs", "--quiet"},
 		},
 		{
-			name:  "buildkite keeps default wait args",
+			name:  "buildkite waits quietly",
 			ciCmd: "buildkite",
-			want:  []string{"wait"},
+			want:  []string{"wait", "--quiet"},
 		},
 	}
 

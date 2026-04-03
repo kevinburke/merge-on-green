@@ -335,7 +335,9 @@ func waitCommandArgs(ciCmd string) []string {
 	if ciCmd == "github-actions" {
 		args = append(args, "--cancel-previous-runs")
 	}
-	// TODO: add --quiet to buildkite, then uncomment here.
+	if ciCmd == "github-actions" || ciCmd == "buildkite" {
+		args = append(args, "--quiet")
+	}
 	return args
 }
 
