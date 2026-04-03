@@ -19,6 +19,7 @@ type worktreeInfo struct {
 }
 
 func main() {
+	branch := flag.String("branch", "", "Branch to merge; defaults to the current branch")
 	version := flag.Bool("version", false, "Print version and exit")
 	maxRetries := flag.Int("max-retries", 5, "Maximum number of rebase/retry attempts")
 	flag.Parse()
@@ -29,24 +30,31 @@ func main() {
 	}
 
 	ctx := context.Background()
-	if err := run(ctx, *maxRetries); err != nil {
+	if err := run(ctx, *branch, *maxRetries); err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, maxRetries int) error {
+func run(ctx context.Context, requestedBranch string, maxRetries int) error {
 	ciCmd, err := detectCI(ctx)
 	if err != nil {
 		return err
 	}
 	slog.Info("detected CI", "tool", ciCmd)
 
-	branch, err := currentBranch(ctx)
+	branch, branchDir, cleanup, err := resolveBranchDir(ctx, requestedBranch)
 	if err != nil {
 		return err
 	}
-	slog.Info("current branch", "branch", branch)
+	if cleanup != nil {
+		defer func() {
+			if err := cleanup(ctx); err != nil {
+				slog.Warn("temporary branch cleanup failed", "branch", branch, "error", err.Error())
+			}
+		}()
+	}
+	slog.Info("selected branch", "branch", branch, "path", branchDir)
 
 	defaultBranch, err := defaultRemoteBranch(ctx)
 	if err != nil {
@@ -63,42 +71,42 @@ func run(ctx context.Context, maxRetries int) error {
 			slog.Info("retrying", "attempt", attempt+1)
 		}
 
-		if err := gitFetch(ctx); err != nil {
+		if err := gitFetch(ctx, branchDir); err != nil {
 			return fmt.Errorf("fetching origin: %w", err)
 		}
 
-		rebasing, err := needsRebase(ctx, defaultBranch)
+		rebasing, err := needsRebase(ctx, branchDir, defaultBranch)
 		if err != nil {
 			return err
 		}
 		if rebasing {
 			slog.Info("rebasing onto default branch", "base", defaultBranch)
-			if err := rebase(ctx, defaultBranch); err != nil {
+			if err := rebase(ctx, branchDir, defaultBranch); err != nil {
 				return fmt.Errorf("rebase onto origin/%s failed: %w", defaultBranch, err)
 			}
 			slog.Info("force pushing rebased branch")
-			if err := forcePush(ctx, branch); err != nil {
+			if err := forcePush(ctx, branchDir, branch); err != nil {
 				return fmt.Errorf("force push failed: %w", err)
 			}
 		}
 
-		if err := ensureBranchPushed(ctx, branch); err != nil {
+		if err := ensureBranchPushed(ctx, branchDir, branch); err != nil {
 			return err
 		}
 
 		slog.Info("waiting for CI to complete")
-		if err := waitForCI(ctx, ciCmd); err != nil {
+		if err := waitForCI(ctx, branchDir, ciCmd); err != nil {
 			// CI failure: the wait command already printed the output.
 			return fmt.Errorf("CI failed on branch %s", branch)
 		}
 		slog.Info("CI passed")
 
 		// Fetch again in case the default branch moved while CI was running.
-		if err := gitFetch(ctx); err != nil {
+		if err := gitFetch(ctx, branchDir); err != nil {
 			return fmt.Errorf("fetching origin: %w", err)
 		}
 
-		rebasing, err = needsRebase(ctx, defaultBranch)
+		rebasing, err = needsRebase(ctx, branchDir, defaultBranch)
 		if err != nil {
 			return err
 		}
@@ -108,7 +116,7 @@ func run(ctx context.Context, maxRetries int) error {
 		}
 
 		slog.Info("pushing to default branch", "branch", defaultBranch)
-		if err := pushToDefault(ctx, defaultBranch); err != nil {
+		if err := pushToDefault(ctx, branchDir, defaultBranch); err != nil {
 			slog.Warn("push failed, will retry", "error", err.Error())
 			continue
 		}
@@ -122,6 +130,88 @@ func run(ctx context.Context, maxRetries int) error {
 	}
 
 	return fmt.Errorf("exceeded maximum retry attempts (%d)", maxRetries)
+}
+
+func resolveBranchDir(ctx context.Context, requestedBranch string) (string, string, func(context.Context) error, error) {
+	controlDir, err := gitRoot(ctx)
+	if err != nil {
+		return "", "", nil, err
+	}
+	current, currentErr := currentBranch(ctx)
+	if requestedBranch == "" {
+		if currentErr != nil {
+			return "", "", nil, currentErr
+		}
+		return current, controlDir, nil, nil
+	}
+	if currentErr == nil && requestedBranch == current {
+		return requestedBranch, controlDir, nil, nil
+	}
+
+	worktrees, err := listWorktrees(ctx)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if wt, ok := findOptionalWorktreeForBranch(worktrees, requestedBranch); ok {
+		return requestedBranch, wt.path, nil, nil
+	}
+
+	return createTemporaryWorktree(ctx, controlDir, requestedBranch)
+}
+
+func createTemporaryWorktree(ctx context.Context, controlDir, branch string) (string, string, func(context.Context) error, error) {
+	tempDir, err := os.MkdirTemp("", "merge-on-green-"+sanitizeBranchName(branch)+"-")
+	if err != nil {
+		return "", "", nil, fmt.Errorf("creating temporary worktree directory: %w", err)
+	}
+
+	createdLocalBranch := false
+	switch {
+	case branchExists(ctx, controlDir, "refs/heads/"+branch):
+		if err := runGitCommand(ctx, controlDir, "worktree", "add", tempDir, branch); err != nil {
+			return "", "", nil, removeTempDir(tempDir, fmt.Errorf("creating temporary worktree for local branch %q: %w", branch, err))
+		}
+	case branchExists(ctx, controlDir, "refs/remotes/origin/"+branch):
+		if err := runGitCommand(ctx, controlDir, "worktree", "add", "--track", "-b", branch, tempDir, "origin/"+branch); err != nil {
+			return "", "", nil, removeTempDir(tempDir, fmt.Errorf("creating temporary worktree for remote branch %q: %w", branch, err))
+		}
+		createdLocalBranch = true
+	default:
+		return "", "", nil, removeTempDir(tempDir, fmt.Errorf("branch %q does not exist locally or on origin", branch))
+	}
+
+	cleanup := func(ctx context.Context) error {
+		if err := execSilent(ctx, "git", "-C", controlDir, "worktree", "remove", "--force", tempDir); err != nil {
+			if !strings.Contains(err.Error(), "is not a working tree") {
+				return fmt.Errorf("removing temporary worktree %s: %w", tempDir, err)
+			}
+		}
+		if createdLocalBranch && branchExists(ctx, controlDir, "refs/heads/"+branch) {
+			if err := execSilent(ctx, "git", "-C", controlDir, "branch", "-D", branch); err != nil {
+				return fmt.Errorf("deleting temporary local branch %s: %w", branch, err)
+			}
+		}
+		return nil
+	}
+
+	slog.Info("created temporary worktree", "branch", branch, "path", tempDir)
+	return branch, tempDir, cleanup, nil
+}
+
+func branchExists(ctx context.Context, dir, ref string) bool {
+	return execSilentInDir(ctx, dir, "git", "rev-parse", "--verify", ref) == nil
+}
+
+func removeTempDir(path string, err error) error {
+	if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+		return fmt.Errorf("%w (cleanup error: removing %s: %v)", err, path, removeErr)
+	}
+	return err
+}
+
+func sanitizeBranchName(branch string) string {
+	replacer := strings.NewReplacer("/", "-", "\\", "-", " ", "-")
+	return replacer.Replace(branch)
 }
 
 // detectCI returns "github-actions" or "buildkite" based on which CI
@@ -171,8 +261,9 @@ func defaultRemoteBranch(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("could not determine default remote branch; try: git remote set-head origin --auto")
 }
 
-func gitFetch(ctx context.Context) error {
+func gitFetch(ctx context.Context, dir string) error {
 	cmd := exec.CommandContext(ctx, "git", "fetch", "origin")
+	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -180,8 +271,8 @@ func gitFetch(ctx context.Context) error {
 
 // needsRebase reports whether origin/<defaultBranch> is NOT an ancestor of
 // HEAD, meaning a rebase is required before a fast-forward push.
-func needsRebase(ctx context.Context, defaultBranch string) (bool, error) {
-	err := execSilent(ctx, "git", "merge-base", "--is-ancestor", "origin/"+defaultBranch, "HEAD")
+func needsRebase(ctx context.Context, dir, defaultBranch string) (bool, error) {
+	err := execSilentInDir(ctx, dir, "git", "merge-base", "--is-ancestor", "origin/"+defaultBranch, "HEAD")
 	if err == nil {
 		return false, nil
 	}
@@ -192,31 +283,33 @@ func needsRebase(ctx context.Context, defaultBranch string) (bool, error) {
 	return false, fmt.Errorf("checking merge-base: %w", err)
 }
 
-func rebase(ctx context.Context, defaultBranch string) error {
+func rebase(ctx context.Context, dir, defaultBranch string) error {
 	cmd := exec.CommandContext(ctx, "git", "rebase", "origin/"+defaultBranch)
+	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		_ = execSilent(ctx, "git", "rebase", "--abort")
+		_ = execSilentInDir(ctx, dir, "git", "rebase", "--abort")
 		return err
 	}
 	return nil
 }
 
-func forcePush(ctx context.Context, branch string) error {
+func forcePush(ctx context.Context, dir, branch string) error {
 	cmd := exec.CommandContext(ctx, "git", "push", "--force-with-lease", "origin", branch)
+	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-func ensureBranchPushed(ctx context.Context, branch string) error {
-	headSHA, err := execOutput(ctx, "git", "rev-parse", "HEAD")
+func ensureBranchPushed(ctx context.Context, dir, branch string) error {
+	headSHA, err := execOutputInDir(ctx, dir, "git", "rev-parse", "HEAD")
 	if err != nil {
 		return fmt.Errorf("resolving HEAD: %w", err)
 	}
 
-	remoteRefs, err := execOutput(ctx, "git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", "--contains", "HEAD")
+	remoteRefs, err := execOutputInDir(ctx, dir, "git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", "--contains", "HEAD")
 	if err != nil {
 		return fmt.Errorf("checking whether %s is on origin: %w", headSHA, err)
 	}
@@ -226,9 +319,10 @@ func ensureBranchPushed(ctx context.Context, branch string) error {
 	return nil
 }
 
-func waitForCI(ctx context.Context, ciCmd string) error {
+func waitForCI(ctx context.Context, dir, ciCmd string) error {
 	// TODO: add --quiet to buildkite, then uncomment here.
 	cmd := exec.CommandContext(ctx, ciCmd, "wait" /*, "--quiet" */)
+	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -389,8 +483,9 @@ func isCurrentWorktree(targetPath, currentPath string) bool {
 	return currentClean == targetClean || strings.HasPrefix(currentClean, targetClean+string(os.PathSeparator))
 }
 
-func pushToDefault(ctx context.Context, defaultBranch string) error {
+func pushToDefault(ctx context.Context, dir, defaultBranch string) error {
 	cmd := exec.CommandContext(ctx, "git", "push", "origin", "HEAD:refs/heads/"+defaultBranch)
+	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
