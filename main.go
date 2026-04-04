@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const Version = "0.1"
-
 type worktreeInfo struct {
 	path   string
 	branch string
