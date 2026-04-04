@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const Version = "0.1"
@@ -95,17 +96,21 @@ func run(ctx context.Context, requestedBranch string, maxRetries int) error {
 		}
 
 		slog.Info("waiting for CI to complete")
-		if err := waitForCI(ctx, branchDir, ciCmd); err != nil {
+		moved, ciErr := waitForCIOrBranchMove(ctx, branchDir, ciCmd, defaultBranch)
+		if moved {
+			continue
+		}
+		if ciErr != nil {
 			// CI failure: the wait command already printed the output.
 			return fmt.Errorf("CI failed on branch %s", branch)
 		}
 		slog.Info("CI passed")
 
-		// Fetch again in case the default branch moved while CI was running.
+		// Final check: the default branch may have moved between the
+		// last poll tick and CI completion.
 		if err := gitFetch(ctx, branchDir); err != nil {
 			return fmt.Errorf("fetching origin: %w", err)
 		}
-
 		rebasing, err = needsRebase(ctx, branchDir, defaultBranch)
 		if err != nil {
 			return err
@@ -328,6 +333,52 @@ func waitForCI(ctx context.Context, dir, ciCmd string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// waitForCIOrBranchMove runs the CI wait while periodically checking
+// whether the default branch has moved forward. If the default branch
+// moves, the CI wait is cancelled immediately so we can rebase instead
+// of waiting for a CI run whose result we will discard.
+//
+// Returns (true, nil) if the default branch moved, (false, nil) if CI
+// passed, or (false, err) if CI failed.
+func waitForCIOrBranchMove(ctx context.Context, dir, ciCmd, defaultBranch string) (bool, error) {
+	ciCtx, ciCancel := context.WithCancel(ctx)
+	defer ciCancel()
+
+	ciDone := make(chan error, 1)
+	go func() {
+		ciDone <- waitForCI(ciCtx, dir, ciCmd)
+	}()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-ciDone:
+			return false, err
+		case <-ticker.C:
+			if err := execSilentInDir(ctx, dir, "git", "fetch", "origin"); err != nil {
+				slog.Warn("background fetch failed during CI wait", "error", err.Error())
+				continue
+			}
+			moved, err := needsRebase(ctx, dir, defaultBranch)
+			if err != nil {
+				slog.Warn("background rebase check failed during CI wait", "error", err.Error())
+				continue
+			}
+			if moved {
+				slog.Info("default branch moved during CI, cancelling wait to rebase")
+				ciCancel()
+				<-ciDone
+				return true, nil
+			}
+		case <-ctx.Done():
+			<-ciDone
+			return false, ctx.Err()
+		}
+	}
 }
 
 func waitCommandArgs(ciCmd string) []string {
