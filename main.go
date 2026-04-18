@@ -20,6 +20,7 @@ type worktreeInfo struct {
 func main() {
 	branch := flag.String("branch", "", "Branch to merge; defaults to the current branch")
 	version := flag.Bool("version", false, "Print version and exit")
+	verbose := flag.Bool("verbose", false, "Show CI wait output instead of passing --quiet")
 	maxRetries := flag.Int("max-retries", 5, "Maximum number of rebase/retry attempts")
 	flag.Parse()
 
@@ -29,13 +30,13 @@ func main() {
 	}
 
 	ctx := context.Background()
-	if err := run(ctx, *branch, *maxRetries); err != nil {
+	if err := run(ctx, *branch, *maxRetries, *verbose); err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, requestedBranch string, maxRetries int) error {
+func run(ctx context.Context, requestedBranch string, maxRetries int, verbose bool) error {
 	ciCmd, err := detectCI(ctx)
 	if err != nil {
 		return err
@@ -94,7 +95,7 @@ func run(ctx context.Context, requestedBranch string, maxRetries int) error {
 		}
 
 		slog.Info("waiting for CI to complete")
-		moved, ciErr := waitForCIOrBranchMove(ctx, branchDir, ciCmd, defaultBranch)
+		moved, ciErr := waitForCIOrBranchMove(ctx, branchDir, ciCmd, defaultBranch, verbose)
 		if moved {
 			continue
 		}
@@ -325,8 +326,8 @@ func ensureBranchPushed(ctx context.Context, dir, branch string) error {
 	return nil
 }
 
-func waitForCI(ctx context.Context, dir, ciCmd string) error {
-	cmd := exec.CommandContext(ctx, ciCmd, waitCommandArgs(ciCmd)...)
+func waitForCI(ctx context.Context, dir, ciCmd string, verbose bool) error {
+	cmd := exec.CommandContext(ctx, ciCmd, waitCommandArgs(ciCmd, verbose)...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -340,13 +341,13 @@ func waitForCI(ctx context.Context, dir, ciCmd string) error {
 //
 // Returns (true, nil) if the default branch moved, (false, nil) if CI
 // passed, or (false, err) if CI failed.
-func waitForCIOrBranchMove(ctx context.Context, dir, ciCmd, defaultBranch string) (bool, error) {
+func waitForCIOrBranchMove(ctx context.Context, dir, ciCmd, defaultBranch string, verbose bool) (bool, error) {
 	ciCtx, ciCancel := context.WithCancel(ctx)
 	defer ciCancel()
 
 	ciDone := make(chan error, 1)
 	go func() {
-		ciDone <- waitForCI(ciCtx, dir, ciCmd)
+		ciDone <- waitForCI(ciCtx, dir, ciCmd, verbose)
 	}()
 
 	ticker := time.NewTicker(10 * time.Second)
@@ -379,12 +380,12 @@ func waitForCIOrBranchMove(ctx context.Context, dir, ciCmd, defaultBranch string
 	}
 }
 
-func waitCommandArgs(ciCmd string) []string {
+func waitCommandArgs(ciCmd string, verbose bool) []string {
 	args := []string{"wait"}
 	if ciCmd == "github-actions" {
 		args = append(args, "--cancel-previous-runs")
 	}
-	if ciCmd == "github-actions" || ciCmd == "buildkite" {
+	if !verbose && (ciCmd == "github-actions" || ciCmd == "buildkite") {
 		args = append(args, "--quiet")
 	}
 	return args
