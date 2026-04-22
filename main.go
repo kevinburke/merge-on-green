@@ -22,6 +22,7 @@ func main() {
 	version := flag.Bool("version", false, "Print version and exit")
 	verbose := flag.Bool("verbose", false, "Show CI wait output instead of passing --quiet")
 	maxRetries := flag.Int("max-retries", 5, "Maximum number of rebase/retry attempts")
+	skipCI := flag.Bool("skip-ci", false, "Skip CI detection and waiting; rebase, push, and clean up only")
 	flag.Parse()
 
 	if *version {
@@ -30,18 +31,24 @@ func main() {
 	}
 
 	ctx := context.Background()
-	if err := run(ctx, *branch, *maxRetries, *verbose); err != nil {
+	if err := run(ctx, *branch, *maxRetries, *verbose, *skipCI); err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, requestedBranch string, maxRetries int, verbose bool) error {
-	ciCmd, err := detectCI(ctx)
-	if err != nil {
-		return err
+func run(ctx context.Context, requestedBranch string, maxRetries int, verbose, skipCI bool) error {
+	var ciCmd string
+	if !skipCI {
+		detected, err := detectCI(ctx)
+		if err != nil {
+			return err
+		}
+		ciCmd = detected
+		slog.Info("detected CI", "tool", ciCmd)
+	} else {
+		slog.Info("skipping CI detection and wait")
 	}
-	slog.Info("detected CI", "tool", ciCmd)
 
 	branch, branchDir, cleanup, err := resolveBranchDir(ctx, requestedBranch)
 	if err != nil {
@@ -94,29 +101,31 @@ func run(ctx context.Context, requestedBranch string, maxRetries int, verbose bo
 			return err
 		}
 
-		slog.Info("waiting for CI to complete")
-		moved, ciErr := waitForCIOrBranchMove(ctx, branchDir, ciCmd, defaultBranch, verbose)
-		if moved {
-			continue
-		}
-		if ciErr != nil {
-			// CI failure: the wait command already printed the output.
-			return fmt.Errorf("CI failed on branch %s", branch)
-		}
-		slog.Info("CI passed")
+		if !skipCI {
+			slog.Info("waiting for CI to complete")
+			moved, ciErr := waitForCIOrBranchMove(ctx, branchDir, ciCmd, defaultBranch, verbose)
+			if moved {
+				continue
+			}
+			if ciErr != nil {
+				// CI failure: the wait command already printed the output.
+				return fmt.Errorf("CI failed on branch %s", branch)
+			}
+			slog.Info("CI passed")
 
-		// Final check: the default branch may have moved between the
-		// last poll tick and CI completion.
-		if err := gitFetch(ctx, branchDir); err != nil {
-			return fmt.Errorf("fetching origin: %w", err)
-		}
-		rebasing, err = needsRebase(ctx, branchDir, defaultBranch)
-		if err != nil {
-			return err
-		}
-		if rebasing {
-			slog.Info("default branch moved during CI, need to rebase again")
-			continue
+			// Final check: the default branch may have moved between the
+			// last poll tick and CI completion.
+			if err := gitFetch(ctx, branchDir); err != nil {
+				return fmt.Errorf("fetching origin: %w", err)
+			}
+			rebasing, err = needsRebase(ctx, branchDir, defaultBranch)
+			if err != nil {
+				return err
+			}
+			if rebasing {
+				slog.Info("default branch moved during CI, need to rebase again")
+				continue
+			}
 		}
 
 		slog.Info("pushing to default branch", "branch", defaultBranch)
