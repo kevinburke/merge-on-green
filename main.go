@@ -228,19 +228,62 @@ func sanitizeBranchName(branch string) string {
 }
 
 // detectCI returns "github-actions" or "buildkite" based on which CI
-// configuration directory exists in the git root.
+// configuration exists in the git root.
 func detectCI(ctx context.Context) (string, error) {
 	root, err := gitRoot(ctx)
 	if err != nil {
 		return "", err
 	}
-	if info, err := os.Stat(filepath.Join(root, ".github", "workflows")); err == nil && info.IsDir() {
+	return detectCIInRoot(root)
+}
+
+func detectCIInRoot(root string) (string, error) {
+	if ok, err := hasGitHubWorkflowFile(filepath.Join(root, ".github", "workflows")); err != nil {
+		return "", err
+	} else if ok {
 		return "github-actions", nil
 	}
-	if info, err := os.Stat(filepath.Join(root, ".buildkite")); err == nil && info.IsDir() {
+	if ok, err := hasDirectory(filepath.Join(root, ".buildkite")); err != nil {
+		return "", err
+	} else if ok {
 		return "buildkite", nil
 	}
-	return "", fmt.Errorf("no .github/workflows or .buildkite directory in %s", root)
+	return "", fmt.Errorf("no .yml/.yaml files in .github/workflows or .buildkite directory in %s", root)
+}
+
+func hasDirectory(dir string) (bool, error) {
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking %s: %w", dir, err)
+	}
+	return info.IsDir(), nil
+}
+
+func hasGitHubWorkflowFile(dir string) (bool, error) {
+	ok, err := hasDirectory(dir)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, fmt.Errorf("reading %s: %w", dir, err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if ext == ".yml" || ext == ".yaml" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func gitRoot(ctx context.Context) (string, error) {
