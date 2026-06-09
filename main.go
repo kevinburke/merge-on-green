@@ -475,7 +475,8 @@ func postMergeCleanup(ctx context.Context, branch, defaultBranch string) error {
 		if err != nil {
 			return err
 		}
-		if isCurrentWorktree(branchWorktree.path, invocationDir) || primaryCheckout {
+		currentBranchWorktree := isCurrentWorktree(branchWorktree.path, invocationDir)
+		if primaryCheckout || (currentBranchWorktree && !hasDefaultWorktree) {
 			if err := switchCheckoutToDefault(ctx, branchWorktree.path, branch, defaultBranch); err != nil {
 				return err
 			}
@@ -483,6 +484,10 @@ func postMergeCleanup(ctx context.Context, branch, defaultBranch string) error {
 			if err := runGitCommand(ctx, branchWorktree.path, "branch", "-d", branch); err != nil {
 				return fmt.Errorf("deleting local branch %s: %w", branch, err)
 			}
+			return nil
+		}
+		if currentBranchWorktree {
+			slog.Info("leaving current branch worktree in place because default branch has another worktree", "branch", branch, "path", branchWorktree.path)
 			return nil
 		}
 		if err := ensureCleanWorktree(ctx, branchWorktree.path, branch); err != nil {

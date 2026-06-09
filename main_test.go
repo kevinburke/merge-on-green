@@ -139,9 +139,7 @@ func TestWaitCommandArgs(t *testing.T) {
 func TestPostMergeCleanupSwitchesPrimaryCheckoutToDefault(t *testing.T) {
 	tmp := t.TempDir()
 	primary := filepath.Join(tmp, "repo")
-	defaultWorktree := filepath.Join(tmp, "repo-main")
 	mkdirAll(t, filepath.Join(primary, ".git"))
-	mkdirAll(t, defaultWorktree)
 
 	binDir := filepath.Join(tmp, "bin")
 	mkdirAll(t, binDir)
@@ -153,12 +151,12 @@ printf '%s|%s\n' "$PWD" "$*" >> "$GIT_LOG"
 
 case "$*" in
 "worktree list --porcelain")
-	printf 'worktree %s\nbranch refs/heads/feature\n\nworktree %s\nbranch refs/heads/main\n' "$PRIMARY_CHECKOUT" "$DEFAULT_WORKTREE"
+	printf 'worktree %s\nbranch refs/heads/feature\n' "$PRIMARY_CHECKOUT"
 	;;
 "rev-parse --show-toplevel")
 	printf '%s\n' "$PRIMARY_CHECKOUT"
 	;;
-"fetch origin"|"reset --hard origin/main"|"diff --quiet HEAD"|"diff --cached --quiet HEAD"|"ls-files --others --exclude-standard"|"checkout main"|"branch -d feature")
+"fetch origin"|"update-ref refs/heads/main refs/remotes/origin/main"|"diff --quiet HEAD"|"diff --cached --quiet HEAD"|"ls-files --others --exclude-standard"|"checkout main"|"reset --hard origin/main"|"branch -d feature")
 	;;
 *)
 	echo "unexpected git command: $*" >&2
@@ -173,7 +171,6 @@ esac
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("GIT_LOG", logPath)
 	t.Setenv("PRIMARY_CHECKOUT", primary)
-	t.Setenv("DEFAULT_WORKTREE", defaultWorktree)
 
 	if err := postMergeCleanup(context.Background(), "feature", "main"); err != nil {
 		t.Fatalf("postMergeCleanup: %v", err)
@@ -192,6 +189,62 @@ esac
 	}
 	if want := primary + "|branch -d feature"; !strings.Contains(log, want) {
 		t.Fatalf("postMergeCleanup did not delete feature from the primary checkout; want log containing %q, got:\n%s", want, log)
+	}
+}
+
+func TestPostMergeCleanupLeavesCurrentLinkedWorktreeOnBranch(t *testing.T) {
+	tmp := t.TempDir()
+	defaultWorktree := filepath.Join(tmp, "repo")
+	branchWorktree := filepath.Join(tmp, "repo", "worktrees", "feature")
+	mkdirAll(t, filepath.Join(defaultWorktree, ".git"))
+	mkdirAll(t, branchWorktree)
+	writeFile(t, filepath.Join(branchWorktree, ".git"), []byte("gitdir: ../../.git/worktrees/feature\n"))
+
+	binDir := filepath.Join(tmp, "bin")
+	mkdirAll(t, binDir)
+	logPath := filepath.Join(tmp, "git.log")
+	scriptPath := filepath.Join(binDir, "git")
+	script := `#!/bin/sh
+set -eu
+printf '%s|%s\n' "$PWD" "$*" >> "$GIT_LOG"
+
+case "$*" in
+"worktree list --porcelain")
+	printf 'worktree %s\nbranch refs/heads/main\n\nworktree %s\nbranch refs/heads/feature\n' "$DEFAULT_WORKTREE" "$BRANCH_WORKTREE"
+	;;
+"rev-parse --show-toplevel")
+	printf '%s\n' "$BRANCH_WORKTREE"
+	;;
+"fetch origin"|"reset --hard origin/main")
+	;;
+*)
+	echo "unexpected git command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%q): %v", scriptPath, err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GIT_LOG", logPath)
+	t.Setenv("DEFAULT_WORKTREE", defaultWorktree)
+	t.Setenv("BRANCH_WORKTREE", branchWorktree)
+
+	if err := postMergeCleanup(context.Background(), "feature", "main"); err != nil {
+		t.Fatalf("postMergeCleanup: %v", err)
+	}
+
+	logContent, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", logPath, err)
+	}
+	log := string(logContent)
+	for _, unexpected := range []string{"checkout main", "worktree remove", "branch -d feature"} {
+		if strings.Contains(log, unexpected) {
+			t.Fatalf("postMergeCleanup ran %q for current linked worktree:\n%s", unexpected, log)
+		}
 	}
 }
 
