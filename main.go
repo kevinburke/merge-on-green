@@ -449,10 +449,11 @@ func postMergeCleanup(ctx context.Context, branch, defaultBranch string) error {
 		return err
 	}
 
-	controlDir, err := gitRoot(ctx)
+	invocationDir, err := gitRoot(ctx)
 	if err != nil {
 		return err
 	}
+	controlDir := invocationDir
 	defaultWorktree, hasDefaultWorktree := findOptionalWorktreeForBranch(worktrees, defaultBranch)
 	branchWorktree, hasBranchWorktree := findOptionalWorktreeForBranch(worktrees, branch)
 
@@ -470,15 +471,16 @@ func postMergeCleanup(ctx context.Context, branch, defaultBranch string) error {
 		if hasDefaultWorktree && branchWorktree.path == defaultWorktree.path {
 			return fmt.Errorf("refusing to remove worktree %s because branch %s is also the default branch worktree", branchWorktree.path, branch)
 		}
-		if isCurrentWorktree(branchWorktree.path, controlDir) {
-			if hasDefaultWorktree {
-				return fmt.Errorf("refusing to delete branch %s because merge-on-green is running from the checkout at %s", branch, branchWorktree.path)
-			}
-			if err := switchCurrentCheckoutToDefault(ctx, controlDir, branch, defaultBranch); err != nil {
+		primaryCheckout, err := isPrimaryCheckout(branchWorktree.path)
+		if err != nil {
+			return err
+		}
+		if isCurrentWorktree(branchWorktree.path, invocationDir) || primaryCheckout {
+			if err := switchCheckoutToDefault(ctx, branchWorktree.path, branch, defaultBranch); err != nil {
 				return err
 			}
 			slog.Info("deleting merged local branch", "branch", branch)
-			if err := runGitCommand(ctx, controlDir, "branch", "-d", branch); err != nil {
+			if err := runGitCommand(ctx, branchWorktree.path, "branch", "-d", branch); err != nil {
 				return fmt.Errorf("deleting local branch %s: %w", branch, err)
 			}
 			return nil
@@ -497,6 +499,17 @@ func postMergeCleanup(ctx context.Context, branch, defaultBranch string) error {
 		return fmt.Errorf("deleting local branch %s: %w", branch, err)
 	}
 	return nil
+}
+
+func isPrimaryCheckout(path string) (bool, error) {
+	info, err := os.Stat(filepath.Join(path, ".git"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking %s: %w", filepath.Join(path, ".git"), err)
+	}
+	return info.IsDir(), nil
 }
 
 func listWorktrees(ctx context.Context) ([]worktreeInfo, error) {
@@ -561,7 +574,7 @@ func updateDefaultBranchRef(ctx context.Context, controlDir, defaultBranch strin
 	return nil
 }
 
-func switchCurrentCheckoutToDefault(ctx context.Context, controlDir, branch, defaultBranch string) error {
+func switchCheckoutToDefault(ctx context.Context, controlDir, branch, defaultBranch string) error {
 	if err := ensureCleanWorktree(ctx, controlDir, branch); err != nil {
 		return err
 	}

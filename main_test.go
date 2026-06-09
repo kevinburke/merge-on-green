@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -132,6 +133,65 @@ func TestWaitCommandArgs(t *testing.T) {
 				t.Fatalf("waitCommandArgs(%q, %t) = %v, want %v", tt.ciCmd, tt.verbose, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPostMergeCleanupSwitchesPrimaryCheckoutToDefault(t *testing.T) {
+	tmp := t.TempDir()
+	primary := filepath.Join(tmp, "repo")
+	defaultWorktree := filepath.Join(tmp, "repo-main")
+	mkdirAll(t, filepath.Join(primary, ".git"))
+	mkdirAll(t, defaultWorktree)
+
+	binDir := filepath.Join(tmp, "bin")
+	mkdirAll(t, binDir)
+	logPath := filepath.Join(tmp, "git.log")
+	scriptPath := filepath.Join(binDir, "git")
+	script := `#!/bin/sh
+set -eu
+printf '%s|%s\n' "$PWD" "$*" >> "$GIT_LOG"
+
+case "$*" in
+"worktree list --porcelain")
+	printf 'worktree %s\nbranch refs/heads/feature\n\nworktree %s\nbranch refs/heads/main\n' "$PRIMARY_CHECKOUT" "$DEFAULT_WORKTREE"
+	;;
+"rev-parse --show-toplevel")
+	printf '%s\n' "$PRIMARY_CHECKOUT"
+	;;
+"fetch origin"|"reset --hard origin/main"|"diff --quiet HEAD"|"diff --cached --quiet HEAD"|"ls-files --others --exclude-standard"|"checkout main"|"branch -d feature")
+	;;
+*)
+	echo "unexpected git command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%q): %v", scriptPath, err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GIT_LOG", logPath)
+	t.Setenv("PRIMARY_CHECKOUT", primary)
+	t.Setenv("DEFAULT_WORKTREE", defaultWorktree)
+
+	if err := postMergeCleanup(context.Background(), "feature", "main"); err != nil {
+		t.Fatalf("postMergeCleanup: %v", err)
+	}
+
+	logContent, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", logPath, err)
+	}
+	log := string(logContent)
+	if strings.Contains(log, "worktree remove") {
+		t.Fatalf("postMergeCleanup tried to remove the primary checkout:\n%s", log)
+	}
+	if want := primary + "|checkout main"; !strings.Contains(log, want) {
+		t.Fatalf("postMergeCleanup did not check out main in the primary checkout; want log containing %q, got:\n%s", want, log)
+	}
+	if want := primary + "|branch -d feature"; !strings.Contains(log, want) {
+		t.Fatalf("postMergeCleanup did not delete feature from the primary checkout; want log containing %q, got:\n%s", want, log)
 	}
 }
 
