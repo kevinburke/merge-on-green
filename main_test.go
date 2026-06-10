@@ -192,7 +192,7 @@ esac
 	}
 }
 
-func TestPostMergeCleanupLeavesCurrentLinkedWorktreeOnBranch(t *testing.T) {
+func TestPostMergeCleanupRemovesCurrentLinkedWorktree(t *testing.T) {
 	tmp := t.TempDir()
 	defaultWorktree := filepath.Join(tmp, "repo")
 	branchWorktree := filepath.Join(tmp, "repo", "worktrees", "feature")
@@ -215,7 +215,7 @@ case "$*" in
 "rev-parse --show-toplevel")
 	printf '%s\n' "$BRANCH_WORKTREE"
 	;;
-"fetch origin"|"reset --hard origin/main")
+"fetch origin"|"reset --hard origin/main"|"diff --quiet HEAD"|"diff --cached --quiet HEAD"|"ls-files --others --exclude-standard"|"worktree remove $BRANCH_WORKTREE"|"branch -d feature")
 	;;
 *)
 	echo "unexpected git command: $*" >&2
@@ -241,10 +241,14 @@ esac
 		t.Fatalf("ReadFile(%q): %v", logPath, err)
 	}
 	log := string(logContent)
-	for _, unexpected := range []string{"checkout main", "worktree remove", "branch -d feature"} {
-		if strings.Contains(log, unexpected) {
-			t.Fatalf("postMergeCleanup ran %q for current linked worktree:\n%s", unexpected, log)
-		}
+	if strings.Contains(log, "checkout main") {
+		t.Fatalf("postMergeCleanup tried to check out main in the current linked worktree:\n%s", log)
+	}
+	if want := defaultWorktree + "|worktree remove " + branchWorktree; !strings.Contains(log, want) {
+		t.Fatalf("postMergeCleanup did not remove the current linked worktree; want log containing %q, got:\n%s", want, log)
+	}
+	if want := defaultWorktree + "|branch -d feature"; !strings.Contains(log, want) {
+		t.Fatalf("postMergeCleanup did not delete feature after removing its worktree; want log containing %q, got:\n%s", want, log)
 	}
 }
 

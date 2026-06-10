@@ -486,10 +486,6 @@ func postMergeCleanup(ctx context.Context, branch, defaultBranch string) error {
 			}
 			return nil
 		}
-		if currentBranchWorktree {
-			slog.Info("leaving current branch worktree in place because default branch has another worktree", "branch", branch, "path", branchWorktree.path)
-			return nil
-		}
 		if err := ensureCleanWorktree(ctx, branchWorktree.path, branch); err != nil {
 			return err
 		}
