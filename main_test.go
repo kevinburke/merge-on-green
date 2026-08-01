@@ -136,6 +136,19 @@ func TestWaitCommandArgs(t *testing.T) {
 	}
 }
 
+func TestEnsureCommandAvailable(t *testing.T) {
+	binDir := t.TempDir()
+	t.Setenv("PATH", binDir)
+
+	err := ensureCommandAvailable("github-actions")
+	if err == nil {
+		t.Fatal("ensureCommandAvailable succeeded, want an error")
+	}
+	if want := `required command "github-actions" is not available in PATH`; !strings.Contains(err.Error(), want) {
+		t.Fatalf("ensureCommandAvailable error = %q, want substring %q", err, want)
+	}
+}
+
 func TestPostMergeCleanupSwitchesPrimaryCheckoutToDefault(t *testing.T) {
 	tmp := t.TempDir()
 	primary := filepath.Join(tmp, "repo")

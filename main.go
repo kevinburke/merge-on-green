@@ -45,6 +45,9 @@ func run(ctx context.Context, requestedBranch string, maxRetries int, verbose, s
 			return err
 		}
 		ciCmd = detected
+		if err := ensureCommandAvailable(ciCmd); err != nil {
+			return err
+		}
 		slog.Info("detected CI", "tool", ciCmd)
 	} else {
 		slog.Info("skipping CI detection and wait")
@@ -379,11 +382,21 @@ func ensureBranchPushed(ctx context.Context, dir, branch string) error {
 }
 
 func waitForCI(ctx context.Context, dir, ciCmd string, verbose bool) error {
+	if err := ensureCommandAvailable(ciCmd); err != nil {
+		return err
+	}
 	cmd := exec.CommandContext(ctx, ciCmd, waitCommandArgs(ciCmd, verbose)...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func ensureCommandAvailable(name string) error {
+	if _, err := exec.LookPath(name); err != nil {
+		return fmt.Errorf("required command %q is not available in PATH; install it before running merge-on-green: %w", name, err)
+	}
+	return nil
 }
 
 // waitForCIOrBranchMove runs the CI wait while periodically checking
