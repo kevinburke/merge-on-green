@@ -149,6 +149,67 @@ func TestEnsureCommandAvailable(t *testing.T) {
 	}
 }
 
+func TestRunReturnsErrorAfterExhaustingRetries(t *testing.T) {
+	tmp := t.TempDir()
+	binDir := filepath.Join(tmp, "bin")
+	mkdirAll(t, binDir)
+	pushLog := filepath.Join(tmp, "push.log")
+	scriptPath := filepath.Join(binDir, "git")
+	script := `#!/bin/sh
+set -eu
+
+case "$*" in
+"rev-parse --show-toplevel")
+	printf '%s\n' "$REPO_ROOT"
+	;;
+"symbolic-ref --short HEAD")
+	printf 'feature\n'
+	;;
+"rev-parse --abbrev-ref origin/HEAD")
+	printf 'origin/main\n'
+	;;
+"fetch origin"|"merge-base --is-ancestor origin/main HEAD")
+	;;
+"rev-parse HEAD")
+	printf '0123456789abcdef\n'
+	;;
+"for-each-ref --format=%(refname:short) refs/remotes/origin --contains HEAD")
+	printf 'origin/feature\n'
+	;;
+"push origin HEAD:refs/heads/main")
+	printf 'push\n' >> "$PUSH_LOG"
+	exit 1
+	;;
+*)
+	echo "unexpected git command: $*" >&2
+	exit 2
+	;;
+esac
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%q): %v", scriptPath, err)
+	}
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PUSH_LOG", pushLog)
+	t.Setenv("REPO_ROOT", tmp)
+
+	err := run(context.Background(), "", 2, false, true)
+	if err == nil {
+		t.Fatal("run succeeded after exhausting retries, want an error")
+	}
+	if want := "exceeded maximum retry attempts (2)"; err.Error() != want {
+		t.Fatalf("run error = %q, want %q", err, want)
+	}
+	content, readErr := os.ReadFile(pushLog)
+	if readErr != nil {
+		t.Fatalf("ReadFile(%q): %v", pushLog, readErr)
+	}
+	if got, want := strings.Count(string(content), "push\n"), 2; got != want {
+		t.Fatalf("push attempts = %d, want %d", got, want)
+	}
+}
+
 func TestPostMergeCleanupSwitchesPrimaryCheckoutToDefault(t *testing.T) {
 	tmp := t.TempDir()
 	primary := filepath.Join(tmp, "repo")
