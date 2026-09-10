@@ -12,7 +12,14 @@ jobs:
       with:
         go-version: ${{ matrix.go-version }}
     - uses: actions/checkout@v6
+    # Only on the newest Go in the matrix. setup-go pins GOTOOLCHAIN=local,
+    # and goimports@latest tracks the current Go release, so installing it
+    # under an older Go fails outright ("golang.org/x/tools@v0.50.0 requires
+    # go >= 1.26.0"). Formatting is a property of the tree rather than of the
+    # toolchain, so checking it once is enough; the older Go still runs the
+    # tests below, which is what the matrix is for.
     - name: Verify generated files are up to date
+      if: matrix.go-version == '1.26.x'
       run: |
         go install github.com/kevinburke/differ@latest
         go install golang.org/x/tools/cmd/goimports@latest
