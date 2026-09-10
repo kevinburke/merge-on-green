@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -106,11 +107,14 @@ func run(ctx context.Context, requestedBranch string, maxRetries int, verbose, s
 
 		if !skipCI {
 			slog.Info("waiting for CI to complete")
-			moved, ciErr := waitForCIOrBranchMove(ctx, branchDir, ciCmd, defaultBranch, verbose)
+			moved, ciErr := waitForCIWithRetries(ctx, branchDir, ciCmd, defaultBranch, verbose)
 			if moved {
 				continue
 			}
 			if ciErr != nil {
+				if isTemporaryCIError(ciErr) {
+					return fmt.Errorf("CI never reached a verdict on branch %s: %w", branch, ciErr)
+				}
 				// CI failure: the wait command already printed the output.
 				return fmt.Errorf("CI failed on branch %s", branch)
 			}
@@ -443,6 +447,65 @@ func waitForCIOrBranchMove(ctx context.Context, dir, ciCmd, defaultBranch string
 			return false, ctx.Err()
 		}
 	}
+}
+
+// maxTemporaryCIFailures and temporaryCIBackoff bound how long to keep asking
+// CI for a verdict it could not give.
+//
+// This budget is deliberately separate from maxRetries. A CI API that is
+// throttled has nothing to do with the default branch moving underneath us,
+// and letting the two share a budget means a contended API silently spends
+// the attempts that exist to land the merge.
+const maxTemporaryCIFailures = 3
+
+// temporaryCIBackoff is a variable only so tests need not wait it out.
+var temporaryCIBackoff = 30 * time.Second
+
+// waitForCIWithRetries waits for CI, retrying while CI cannot reach a verdict.
+//
+// "Could not reach a verdict" is a different thing from "the build failed",
+// and conflating them is expensive in both directions: reporting a throttled
+// API as a red build sends someone to debug a healthy branch, and retrying a
+// red build hammers CI with a change that will never pass. The CI tool
+// reports the distinction as an exit status; see isTemporaryCIError.
+func waitForCIWithRetries(ctx context.Context, dir, ciCmd, defaultBranch string, verbose bool) (bool, error) {
+	for attempt := 1; ; attempt++ {
+		moved, ciErr := waitForCIOrBranchMove(ctx, dir, ciCmd, defaultBranch, verbose)
+		if moved || ciErr == nil || !isTemporaryCIError(ciErr) {
+			return moved, ciErr
+		}
+		if attempt >= maxTemporaryCIFailures {
+			return false, fmt.Errorf("CI did not reach a verdict in %d attempts; the build was never created, or the API stayed throttled: %w", attempt, ciErr)
+		}
+		backoff := temporaryCIBackoff * time.Duration(attempt)
+		slog.Warn("CI did not reach a verdict, retrying",
+			"attempt", attempt, "of", maxTemporaryCIFailures,
+			"backoff", backoff, "error", ciErr.Error())
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+}
+
+// exitTemporary is the status a CI wait tool uses to say it could not reach a
+// verdict -- it was throttled, or no build was ever created for the commit --
+// as opposed to the build having failed. It is EX_TEMPFAIL from sysexits(3),
+// and `buildkite wait` documents it.
+const exitTemporary = 75
+
+// isTemporaryCIError reports whether the CI wait failed to produce a verdict
+// rather than producing a bad one.
+func isTemporaryCIError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode() == exitTemporary
+	}
+	return false
 }
 
 func waitCommandArgs(ciCmd string, verbose bool) []string {

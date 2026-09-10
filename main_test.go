@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDetectCIInRoot(t *testing.T) {
@@ -338,5 +342,118 @@ func writeFile(t *testing.T, path string, content []byte) {
 	mkdirAll(t, filepath.Dir(path))
 	if err := os.WriteFile(path, content, 0o644); err != nil {
 		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+}
+
+// writeFakeCI installs a CI wait command on PATH whose exit statuses are read,
+// one per invocation, from the statuses slice.
+func writeFakeCI(t *testing.T, name string, statuses []int) {
+	t.Helper()
+	binDir := t.TempDir()
+	countFile := filepath.Join(t.TempDir(), "count")
+	var cases strings.Builder
+	for i, status := range statuses {
+		fmt.Fprintf(&cases, "%d) exit %d ;;\n", i+1, status)
+	}
+	script := fmt.Sprintf(`#!/bin/sh
+set -eu
+n=$(cat "%s" 2>/dev/null || echo 0)
+n=$((n + 1))
+printf '%%s' "$n" > "%s"
+case "$n" in
+%sesac
+exit 0
+`, countFile, countFile, cases.String())
+	path := filepath.Join(binDir, name)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile(%q): %v", path, err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestIsTemporaryCIError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		exit int
+		want bool
+	}{
+		// The distinction this whole path turns on: 1 is a verdict about the
+		// branch, 75 is CI failing to give one.
+		{"failed build", 1, false},
+		{"could not reach a verdict", exitTemporary, true},
+		{"usage error", 2, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", tt.exit)).Run()
+			if err == nil {
+				t.Fatalf("expected a non-zero exit for status %d", tt.exit)
+			}
+			if got := isTemporaryCIError(err); got != tt.want {
+				t.Errorf("isTemporaryCIError(exit %d) = %v, want %v", tt.exit, got, tt.want)
+			}
+		})
+	}
+
+	if isTemporaryCIError(nil) {
+		t.Error("isTemporaryCIError(nil) = true, want false")
+	}
+	if isTemporaryCIError(errors.New("boom")) {
+		t.Error("a non-exit error must not be treated as temporary")
+	}
+}
+
+func TestWaitForCIRetriesUntilAVerdict(t *testing.T) {
+	// A throttled CI API is not a red build, so keep asking.
+	writeFakeCI(t, "buildkite", []int{exitTemporary, exitTemporary, 0})
+	temporaryCIBackoff = time.Millisecond
+	t.Cleanup(func() { temporaryCIBackoff = 30 * time.Second })
+
+	moved, err := waitForCIWithRetries(context.Background(), t.TempDir(), "buildkite", "main", false)
+	if err != nil {
+		t.Fatalf("waitForCIWithRetries: %v", err)
+	}
+	if moved {
+		t.Error("moved = true, want false")
+	}
+}
+
+func TestWaitForCIDoesNotRetryAFailedBuild(t *testing.T) {
+	// Retrying a red build would hammer CI with a change that cannot pass,
+	// and would bury the failure the developer needs to see.
+	writeFakeCI(t, "buildkite", []int{1, 0})
+	temporaryCIBackoff = time.Millisecond
+	t.Cleanup(func() { temporaryCIBackoff = 30 * time.Second })
+
+	_, err := waitForCIWithRetries(context.Background(), t.TempDir(), "buildkite", "main", false)
+	if err == nil {
+		t.Fatal("waitForCIWithRetries succeeded, want the build failure reported on the first attempt")
+	}
+	if isTemporaryCIError(err) {
+		t.Errorf("a failed build was classified as temporary: %v", err)
+	}
+}
+
+func TestWaitForCIGivesUpAfterRepeatedNonVerdicts(t *testing.T) {
+	statuses := make([]int, maxTemporaryCIFailures+2)
+	for i := range statuses {
+		statuses[i] = exitTemporary
+	}
+	writeFakeCI(t, "buildkite", statuses)
+	temporaryCIBackoff = time.Millisecond
+	t.Cleanup(func() { temporaryCIBackoff = 30 * time.Second })
+
+	_, err := waitForCIWithRetries(context.Background(), t.TempDir(), "buildkite", "main", false)
+	if err == nil {
+		t.Fatal("waitForCIWithRetries succeeded, want an error")
+	}
+	if !isTemporaryCIError(err) {
+		t.Errorf("giving up must stay classified as temporary so the caller does not report a failed build: %v", err)
+	}
+	if want := "did not reach a verdict"; !strings.Contains(err.Error(), want) {
+		t.Errorf("error = %q, want it to name the real problem (%q)", err, want)
 	}
 }
