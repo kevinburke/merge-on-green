@@ -349,6 +349,12 @@ func needsRebase(ctx context.Context, dir, defaultBranch string) (bool, error) {
 func rebase(ctx context.Context, dir, defaultBranch string) error {
 	cmd := exec.CommandContext(ctx, "git", "rebase", "origin/"+defaultBranch)
 	cmd.Dir = dir
+	// GIT_SEQUENCE_EDITOR covers `rebase -i`'s todo-list editor (it takes
+	// precedence over GIT_EDITOR there); GIT_EDITOR covers message edits
+	// during a reword/squash or a --continue after resolving a conflict.
+	// Neither should ever fire for this non-interactive rebase, but set
+	// both so a stray prompt can't hang an unattended run.
+	cmd.Env = append(os.Environ(), "GIT_SEQUENCE_EDITOR=true", "GIT_EDITOR=true")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
