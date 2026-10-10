@@ -101,30 +101,35 @@ func TestWaitCommandArgs(t *testing.T) {
 	tests := []struct {
 		name    string
 		ciCmd   string
+		remote  string
 		verbose bool
 		want    []string
 	}{
 		{
-			name:  "github actions cancels older runs quietly by default",
-			ciCmd: "github-actions",
-			want:  []string{"wait", "--cancel-previous-runs", "--quiet"},
+			name:   "github actions cancels older runs quietly by default",
+			ciCmd:  "github-actions",
+			remote: "origin",
+			want:   []string{"wait", "--remote", "origin", "--cancel-previous-runs", "--quiet"},
 		},
 		{
-			name:  "buildkite waits quietly by default",
-			ciCmd: "buildkite",
-			want:  []string{"wait", "--quiet"},
+			name:   "buildkite waits quietly by default",
+			ciCmd:  "buildkite",
+			remote: "upstream",
+			want:   []string{"wait", "--remote", "upstream", "--quiet"},
 		},
 		{
 			name:    "github actions verbose disables quiet mode",
 			ciCmd:   "github-actions",
+			remote:  "upstream",
 			verbose: true,
-			want:    []string{"wait", "--cancel-previous-runs"},
+			want:    []string{"wait", "--remote", "upstream", "--cancel-previous-runs"},
 		},
 		{
 			name:    "buildkite verbose disables quiet mode",
 			ciCmd:   "buildkite",
+			remote:  "origin",
 			verbose: true,
-			want:    []string{"wait"},
+			want:    []string{"wait", "--remote", "origin"},
 		},
 	}
 
@@ -132,9 +137,9 @@ func TestWaitCommandArgs(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := waitCommandArgs(tt.ciCmd, tt.verbose)
+			got := waitCommandArgs(tt.ciCmd, tt.remote, tt.verbose)
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Fatalf("waitCommandArgs(%q, %t) = %v, want %v", tt.ciCmd, tt.verbose, got, tt.want)
+				t.Fatalf("waitCommandArgs(%q, %q, %t) = %v, want %v", tt.ciCmd, tt.remote, tt.verbose, got, tt.want)
 			}
 		})
 	}
@@ -151,6 +156,163 @@ func TestEnsureCommandAvailable(t *testing.T) {
 	if want := `required command "github-actions" is not available in PATH`; !strings.Contains(err.Error(), want) {
 		t.Fatalf("ensureCommandAvailable error = %q, want substring %q", err, want)
 	}
+}
+
+func TestRunUsesSelectedRemote(t *testing.T) {
+	for _, skipCI := range []bool{false, true} {
+		t.Run(fmt.Sprintf("skip-ci=%t", skipCI), func(t *testing.T) {
+			root := t.TempDir()
+			mkdirAll(t, filepath.Join(root, ".git"))
+			writeFile(t, filepath.Join(root, ".github", "workflows", "ci.yml"), []byte("name: CI\n"))
+			binDir := filepath.Join(root, "bin")
+			mkdirAll(t, binDir)
+			logPath := filepath.Join(root, "commands.log")
+			gitScript := `#!/bin/sh
+set -eu
+printf 'git %s\n' "$*" >> "$COMMAND_LOG"
+case "$*" in
+"rev-parse --show-toplevel") printf '%s\n' "$REPO_ROOT" ;;
+"symbolic-ref --short HEAD") printf 'feature\n' ;;
+"rev-parse --abbrev-ref upstream/HEAD") printf 'upstream/trunk\n' ;;
+"fetch upstream"|"rebase upstream/trunk"|"push --force-with-lease upstream feature"|"push upstream HEAD:refs/heads/trunk") ;;
+"merge-base --is-ancestor upstream/trunk HEAD")
+    if [ ! -f "$REBASE_CHECK" ]; then
+        touch "$REBASE_CHECK"
+        exit 1
+    fi
+    ;;
+"rev-parse HEAD") printf '0123456789abcdef\n' ;;
+"for-each-ref --format=%(refname:short) refs/remotes/upstream/ --contains HEAD") printf 'upstream/feature\n' ;;
+"worktree list --porcelain") printf 'worktree %s\nbranch refs/heads/feature\n' "$REPO_ROOT" ;;
+"update-ref refs/heads/trunk refs/remotes/upstream/trunk"|"checkout trunk"|"reset --hard upstream/trunk"|"branch -d feature"|"diff --quiet HEAD"|"diff --cached --quiet HEAD"|"ls-files --others --exclude-standard") ;;
+*) echo "unexpected git command: $*" >&2; exit 2 ;;
+esac
+`
+			ciScript := `#!/bin/sh
+set -eu
+printf 'github-actions %s\n' "$*" >> "$COMMAND_LOG"
+test "$*" = "wait --remote upstream --cancel-previous-runs --quiet"
+`
+			for name, script := range map[string]string{"git": gitScript, "github-actions": ciScript} {
+				if err := os.WriteFile(filepath.Join(binDir, name), []byte(script), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("COMMAND_LOG", logPath)
+			t.Setenv("REPO_ROOT", root)
+			t.Setenv("REBASE_CHECK", filepath.Join(root, "rebase-check"))
+			if err := run(context.Background(), "", "upstream", 2, false, skipCI); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			content, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log := string(content)
+			for _, command := range []string{
+				"git fetch upstream",
+				"git rebase upstream/trunk",
+				"git push --force-with-lease upstream feature",
+				"git for-each-ref --format=%(refname:short) refs/remotes/upstream/ --contains HEAD",
+				"git push upstream HEAD:refs/heads/trunk",
+				"git update-ref refs/heads/trunk refs/remotes/upstream/trunk",
+				"git reset --hard upstream/trunk",
+				"git branch -d feature",
+			} {
+				if !strings.Contains(log, command+"\n") {
+					t.Errorf("missing command %q in log:\n%s", command, log)
+				}
+			}
+			if strings.Contains(log, "origin") {
+				t.Errorf("used origin with --remote upstream:\n%s", log)
+			}
+			if got := strings.Contains(log, "github-actions wait --remote upstream"); got == skipCI {
+				t.Errorf("CI wait present = %t with skip-ci=%t:\n%s", got, skipCI, log)
+			}
+		})
+	}
+}
+
+func TestRunRejectsInvalidRemote(t *testing.T) {
+	t.Parallel()
+	for _, remote := range []string{"", "--all"} {
+		if err := run(context.Background(), "", remote, 1, false, true); err == nil || !strings.Contains(err.Error(), "invalid Git remote") {
+			t.Errorf("run with remote %q: got %v, want invalid remote error", remote, err)
+		}
+	}
+}
+
+func TestEnsureBranchPushedIgnoresOtherRemotes(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	selected := filepath.Join(root, "selected.git")
+	other := filepath.Join(root, "other.git")
+	gitTestCommand(t, root, "init", "--initial-branch=main", repo)
+	gitTestCommand(t, root, "init", "--bare", selected)
+	gitTestCommand(t, root, "init", "--bare", other)
+	gitTestCommand(t, repo, "config", "user.name", "Test User")
+	gitTestCommand(t, repo, "config", "user.email", "test@example.com")
+	gitTestCommand(t, repo, "commit", "--allow-empty", "--message=initial")
+	gitTestCommand(t, repo, "remote", "add", "upstream", selected)
+	gitTestCommand(t, repo, "remote", "add", "origin", other)
+	gitTestCommand(t, repo, "remote", "add", "upstream-other", other)
+	gitTestCommand(t, repo, "push", "upstream", "main")
+	gitTestCommand(t, repo, "checkout", "-b", "feature")
+	gitTestCommand(t, repo, "commit", "--allow-empty", "--message=feature")
+	gitTestCommand(t, repo, "push", "origin", "feature")
+	gitTestCommand(t, repo, "fetch", "upstream-other")
+
+	if err := ensureBranchPushed(context.Background(), repo, "upstream", "feature"); err != nil {
+		t.Fatalf("ensureBranchPushed: %v", err)
+	}
+	if got, want := gitTestCommand(t, selected, "rev-parse", "refs/heads/feature"), gitTestCommand(t, repo, "rev-parse", "HEAD"); got != want {
+		t.Fatalf("selected remote feature = %s, want %s", got, want)
+	}
+	// Once the commit is on upstream, no push should be attempted.
+	gitTestCommand(t, repo, "remote", "set-url", "--push", "upstream", filepath.Join(root, "missing.git"))
+	if err := ensureBranchPushed(context.Background(), repo, "upstream", "feature"); err != nil {
+		t.Fatalf("ensureBranchPushed pushed a commit already on upstream: %v", err)
+	}
+}
+
+func TestCreateTemporaryWorktreeUsesSelectedRemote(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	gitTestCommand(t, root, "init", "--initial-branch=main")
+	gitTestCommand(t, root, "config", "user.name", "Test User")
+	gitTestCommand(t, root, "config", "user.email", "test@example.com")
+	gitTestCommand(t, root, "commit", "--allow-empty", "--message=initial")
+	gitTestCommand(t, root, "remote", "add", "upstream", filepath.Join(root, "unused.git"))
+	gitTestCommand(t, root, "update-ref", "refs/remotes/upstream/feature", "HEAD")
+
+	branch, dir, cleanup, err := createTemporaryWorktree(context.Background(), root, "upstream", "feature")
+	if err != nil {
+		t.Fatalf("createTemporaryWorktree: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cleanup(context.Background()); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+	if branch != "feature" {
+		t.Fatalf("branch = %q, want feature", branch)
+	}
+	if got := gitTestCommand(t, dir, "rev-parse", "--abbrev-ref", "@{upstream}"); got != "upstream/feature" {
+		t.Fatalf("tracking branch = %q, want upstream/feature", got)
+	}
+}
+
+func gitTestCommand(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"}, args...)...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func TestRunReturnsErrorAfterExhaustingRetries(t *testing.T) {
@@ -177,7 +339,7 @@ case "$*" in
 "rev-parse HEAD")
 	printf '0123456789abcdef\n'
 	;;
-"for-each-ref --format=%(refname:short) refs/remotes/origin --contains HEAD")
+"for-each-ref --format=%(refname:short) refs/remotes/origin/ --contains HEAD")
 	printf 'origin/feature\n'
 	;;
 "push origin HEAD:refs/heads/main")
@@ -198,7 +360,7 @@ esac
 	t.Setenv("PUSH_LOG", pushLog)
 	t.Setenv("REPO_ROOT", tmp)
 
-	err := run(context.Background(), "", 2, false, true)
+	err := run(context.Background(), "", "origin", 2, false, true)
 	if err == nil {
 		t.Fatal("run succeeded after exhausting retries, want an error")
 	}
@@ -234,7 +396,7 @@ case "$*" in
 "rev-parse --show-toplevel")
 	printf '%s\n' "$PRIMARY_CHECKOUT"
 	;;
-"fetch origin"|"update-ref refs/heads/main refs/remotes/origin/main"|"diff --quiet HEAD"|"diff --cached --quiet HEAD"|"ls-files --others --exclude-standard"|"checkout main"|"reset --hard origin/main"|"branch -d feature")
+"fetch upstream"|"update-ref refs/heads/main refs/remotes/upstream/main"|"diff --quiet HEAD"|"diff --cached --quiet HEAD"|"ls-files --others --exclude-standard"|"checkout main"|"reset --hard upstream/main"|"branch -d feature")
 	;;
 *)
 	echo "unexpected git command: $*" >&2
@@ -250,7 +412,7 @@ esac
 	t.Setenv("GIT_LOG", logPath)
 	t.Setenv("PRIMARY_CHECKOUT", primary)
 
-	if err := postMergeCleanup(context.Background(), "feature", "main"); err != nil {
+	if err := postMergeCleanup(context.Background(), "feature", "upstream", "main"); err != nil {
 		t.Fatalf("postMergeCleanup: %v", err)
 	}
 
@@ -310,7 +472,7 @@ esac
 	t.Setenv("DEFAULT_WORKTREE", defaultWorktree)
 	t.Setenv("BRANCH_WORKTREE", branchWorktree)
 
-	if err := postMergeCleanup(context.Background(), "feature", "main"); err != nil {
+	if err := postMergeCleanup(context.Background(), "feature", "origin", "main"); err != nil {
 		t.Fatalf("postMergeCleanup: %v", err)
 	}
 
@@ -412,7 +574,7 @@ func TestWaitForCIRetriesUntilAVerdict(t *testing.T) {
 	temporaryCIBackoff = time.Millisecond
 	t.Cleanup(func() { temporaryCIBackoff = 30 * time.Second })
 
-	moved, err := waitForCIWithRetries(context.Background(), t.TempDir(), "buildkite", "main", false)
+	moved, err := waitForCIWithRetries(context.Background(), t.TempDir(), "buildkite", "origin", "main", false)
 	if err != nil {
 		t.Fatalf("waitForCIWithRetries: %v", err)
 	}
@@ -428,7 +590,7 @@ func TestWaitForCIDoesNotRetryAFailedBuild(t *testing.T) {
 	temporaryCIBackoff = time.Millisecond
 	t.Cleanup(func() { temporaryCIBackoff = 30 * time.Second })
 
-	_, err := waitForCIWithRetries(context.Background(), t.TempDir(), "buildkite", "main", false)
+	_, err := waitForCIWithRetries(context.Background(), t.TempDir(), "buildkite", "origin", "main", false)
 	if err == nil {
 		t.Fatal("waitForCIWithRetries succeeded, want the build failure reported on the first attempt")
 	}
@@ -446,7 +608,7 @@ func TestWaitForCIGivesUpAfterRepeatedNonVerdicts(t *testing.T) {
 	temporaryCIBackoff = time.Millisecond
 	t.Cleanup(func() { temporaryCIBackoff = 30 * time.Second })
 
-	_, err := waitForCIWithRetries(context.Background(), t.TempDir(), "buildkite", "main", false)
+	_, err := waitForCIWithRetries(context.Background(), t.TempDir(), "buildkite", "origin", "main", false)
 	if err == nil {
 		t.Fatal("waitForCIWithRetries succeeded, want an error")
 	}

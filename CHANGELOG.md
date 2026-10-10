@@ -4,6 +4,12 @@ This file summarizes the notable changes in each release. `merge-on-green`
 did not previously have a changelog; since the project is under a year old,
 this covers its entire history.
 
+## Unreleased
+
+- Add `--remote` (default `origin`) to select the Git remote for commit checks,
+  CI waits, branch lookup, rebases, pushes, and post-merge cleanup. For example,
+  `merge-on-green --remote upstream --branch feature`.
+
 ## 0.4 - 2026-09-11
 
 - Set `GIT_SEQUENCE_EDITOR=true` and `GIT_EDITOR=true` on the rebase
