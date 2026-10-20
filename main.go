@@ -8,9 +8,12 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type worktreeInfo struct {
@@ -25,6 +28,7 @@ func main() {
 	verbose := flag.Bool("verbose", false, "Show CI wait output instead of passing --quiet")
 	maxRetries := flag.Int("max-retries", 5, "Maximum number of rebase/retry attempts")
 	skipCI := flag.Bool("skip-ci", false, "Skip CI detection and waiting; rebase, push, and clean up only")
+	timeout := flag.Duration("timeout", defaultTimeout, "Maximum time for the entire invocation, including queueing and CI; must be positive")
 	flag.Parse()
 
 	if *version {
@@ -32,8 +36,9 @@ func main() {
 		return
 	}
 
-	ctx := context.Background()
-	if err := run(ctx, *branch, *remote, *maxRetries, *verbose, *skipCI); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, unix.SIGTERM)
+	defer stop()
+	if err := runWithTimeout(ctx, *branch, *remote, *maxRetries, *verbose, *skipCI, *timeout); err != nil {
 		slog.Error(err.Error())
 		os.Exit(1)
 	}
@@ -57,6 +62,12 @@ func run(ctx context.Context, requestedBranch, remote string, maxRetries int, ve
 	} else {
 		slog.Info("skipping CI detection and wait")
 	}
+
+	lock, err := acquireMergeLock(ctx, ".")
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 
 	branch, branchDir, cleanup, err := resolveBranchDir(ctx, requestedBranch, remote)
 	if err != nil {
@@ -329,7 +340,7 @@ func defaultRemoteBranch(ctx context.Context, remote string) (string, error) {
 }
 
 func gitFetch(ctx context.Context, dir, remote string) error {
-	cmd := exec.CommandContext(ctx, "git", "fetch", remote)
+	cmd := commandContext(ctx, "git", "fetch", remote)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -351,7 +362,7 @@ func needsRebase(ctx context.Context, dir, remote, defaultBranch string) (bool, 
 }
 
 func rebase(ctx context.Context, dir, remote, defaultBranch string) error {
-	cmd := exec.CommandContext(ctx, "git", "rebase", remote+"/"+defaultBranch)
+	cmd := commandContext(ctx, "git", "rebase", remote+"/"+defaultBranch)
 	cmd.Dir = dir
 	// GIT_SEQUENCE_EDITOR covers `rebase -i`'s todo-list editor (it takes
 	// precedence over GIT_EDITOR there); GIT_EDITOR covers message edits
@@ -369,7 +380,7 @@ func rebase(ctx context.Context, dir, remote, defaultBranch string) error {
 }
 
 func forcePush(ctx context.Context, dir, remote, branch string) error {
-	cmd := exec.CommandContext(ctx, "git", "push", "--force-with-lease", remote, branch)
+	cmd := commandContext(ctx, "git", "push", "--force-with-lease", remote, branch)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -399,7 +410,7 @@ func waitForCI(ctx context.Context, dir, ciCmd, remote string, verbose bool) err
 	if err := ensureCommandAvailable(ciCmd); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, ciCmd, waitCommandArgs(ciCmd, remote, verbose)...)
+	cmd := commandContext(ctx, ciCmd, waitCommandArgs(ciCmd, remote, verbose)...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -511,8 +522,7 @@ func isTemporaryCIError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 		return exitErr.ExitCode() == exitTemporary
 	}
 	return false
@@ -612,7 +622,7 @@ func listWorktrees(ctx context.Context) ([]worktreeInfo, error) {
 			continue
 		}
 		var wt worktreeInfo
-		for _, line := range strings.Split(block, "\n") {
+		for line := range strings.SplitSeq(block, "\n") {
 			switch {
 			case strings.HasPrefix(line, "worktree "):
 				wt.path = strings.TrimPrefix(line, "worktree ")
@@ -699,7 +709,7 @@ func isCurrentWorktree(targetPath, currentPath string) bool {
 }
 
 func pushToDefault(ctx context.Context, dir, remote, defaultBranch string) error {
-	cmd := exec.CommandContext(ctx, "git", "push", remote, "HEAD:refs/heads/"+defaultBranch)
+	cmd := commandContext(ctx, "git", "push", remote, "HEAD:refs/heads/"+defaultBranch)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -711,7 +721,7 @@ func execOutput(ctx context.Context, name string, args ...string) (string, error
 }
 
 func execOutputInDir(ctx context.Context, dir, name string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := commandContext(ctx, name, args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
@@ -725,13 +735,13 @@ func execSilent(ctx context.Context, name string, args ...string) error {
 }
 
 func execSilentInDir(ctx context.Context, dir, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := commandContext(ctx, name, args...)
 	cmd.Dir = dir
 	return cmd.Run()
 }
 
 func runGitCommand(ctx context.Context, dir string, args ...string) error {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := commandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

@@ -171,6 +171,7 @@ func TestRunUsesSelectedRemote(t *testing.T) {
 set -eu
 printf 'git %s\n' "$*" >> "$COMMAND_LOG"
 case "$*" in
+"rev-parse --path-format=absolute --git-common-dir") printf '%s/.git\n' "$REPO_ROOT" ;;
 "rev-parse --show-toplevel") printf '%s\n' "$REPO_ROOT" ;;
 "symbolic-ref --short HEAD") printf 'feature\n' ;;
 "rev-parse --abbrev-ref upstream/HEAD") printf 'upstream/trunk\n' ;;
@@ -202,6 +203,30 @@ test "$*" = "wait --remote upstream --cancel-previous-runs --quiet"
 			t.Setenv("COMMAND_LOG", logPath)
 			t.Setenv("REPO_ROOT", root)
 			t.Setenv("REBASE_CHECK", filepath.Join(root, "rebase-check"))
+			// Holding another worktree's merge turn must prevent even the
+			// initial fetch/rebase/push, including with --skip-ci.
+			lock, err := acquireMergeLock(context.Background(), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			blockedErr := run(ctx, "", "upstream", 2, false, skipCI)
+			cancel()
+			if err := lock.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !errors.Is(blockedErr, context.DeadlineExceeded) {
+				t.Fatalf("contending merge returned %v", blockedErr)
+			}
+			blockedLog, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, action := range []string{"git fetch", "git rebase", "git push", "github-actions wait"} {
+				if strings.Contains(string(blockedLog), action) {
+					t.Fatalf("ran %s before acquiring merge turn: %s", action, blockedLog)
+				}
+			}
 			if err := run(context.Background(), "", "upstream", 2, false, skipCI); err != nil {
 				t.Fatalf("run: %v", err)
 			}
@@ -317,6 +342,7 @@ func gitTestCommand(t *testing.T, dir string, args ...string) string {
 
 func TestRunReturnsErrorAfterExhaustingRetries(t *testing.T) {
 	tmp := t.TempDir()
+	mkdirAll(t, filepath.Join(tmp, ".git"))
 	binDir := filepath.Join(tmp, "bin")
 	mkdirAll(t, binDir)
 	pushLog := filepath.Join(tmp, "push.log")
@@ -325,6 +351,9 @@ func TestRunReturnsErrorAfterExhaustingRetries(t *testing.T) {
 set -eu
 
 case "$*" in
+"rev-parse --path-format=absolute --git-common-dir")
+	printf '%s/.git\n' "$REPO_ROOT"
+	;;
 "rev-parse --show-toplevel")
 	printf '%s\n' "$REPO_ROOT"
 	;;

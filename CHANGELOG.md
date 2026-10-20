@@ -6,6 +6,18 @@ this covers its entire history.
 
 ## Unreleased
 
+- Serialize merges across worktrees of the same local repository before
+  rebasing or pushing. Concurrent callers wait without starting CI that
+  another merge would invalidate. The lock releases automatically on exit
+  or a crash; Ctrl-C and SIGTERM cancel waiting. This is local serialization,
+  not a FIFO or cross-host queue; independent clones and direct pushes still
+  require the existing remote-movement checks.
+- Bound the entire invocation, including queueing and holding the merge lock,
+  with `--timeout` (default 30 minutes; must be positive). On timeout or
+  interruption, stop local subprocess groups before releasing the lock. A
+  queued timeout never steals another caller's lock; no lock-file cleanup is
+  necessary. Locking and signal operations use `golang.org/x/sys/unix`.
+- Require Go 1.26, matching the oldest CI toolchain and the x/sys dependency.
 - Add `--remote` (default `origin`) to select the Git remote for commit checks,
   CI waits, branch lookup, rebases, pushes, and post-merge cleanup. For example,
   `merge-on-green --remote upstream --branch feature`.
