@@ -4,7 +4,7 @@ This file summarizes the notable changes in each release. `merge-on-green`
 did not previously have a changelog; since the project is under a year old,
 this covers its entire history.
 
-## Unreleased
+## 0.6 - 2026-10-20
 
 - Serialize merges across worktrees of the same local repository before
   rebasing or pushing. Concurrent callers wait without starting CI that
@@ -18,6 +18,9 @@ this covers its entire history.
   queued timeout never steals another caller's lock; no lock-file cleanup is
   necessary. Locking and signal operations use `golang.org/x/sys/unix`.
 - Require Go 1.26, matching the oldest CI toolchain and the x/sys dependency.
+
+## 0.5 - 2026-10-10
+
 - Add `--remote` (default `origin`) to select the Git remote for commit checks,
   CI waits, branch lookup, rebases, pushes, and post-merge cleanup. For example,
   `merge-on-green --remote upstream --branch feature`.
